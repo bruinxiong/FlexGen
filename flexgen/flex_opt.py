@@ -20,7 +20,7 @@ from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
 from flexgen.timer import timers
-from flexgen.utils import (Task, Env, GB, T, ValueHolder,
+from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
@@ -580,7 +580,13 @@ class TransformerLayer:
 
 
 class OptLM:
-    def __init__(self, config, env, path, policy):
+    def __init__(self,
+                 config: Union[str, OptConfig],
+                 env: ExecutionEnv,
+                 path: str,
+                 policy: Policy):
+        if isinstance(config, str):
+            config = get_opt_config(config)
         self.config = config
         self.env = env
         self.path = path
@@ -628,6 +634,7 @@ class OptLM:
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
+        self.init_all_weights()
 
     def set_task(self, task):
         self.task = task
@@ -762,7 +769,13 @@ class OptLM:
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
             ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
             pos = self.task.prompt_len + i
-            self.output_ids[left:right, pos:pos+1] = ids
+            if self.task.stop:
+                stopped = self.stopped[left:right]
+                self.output_ids[left:right, pos:pos+1] = np.where(
+                    stopped, self.config.pad_token_id, ids)
+                stopped[:] = np.logical_or(stopped, ids == self.task.stop)
+            else:
+                self.output_ids[left:right, pos:pos+1] = ids
         else:  # move to home
             x = self.hidden[i][j][k]
             if x.val:  # x may already be moved due to overlapping
@@ -835,7 +848,9 @@ class OptLM:
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
 
         # Output token ids
-        self.output_ids = np.ones((len(task.inputs), prompt_len + gen_len), dtype=np.int32)
+        self.output_ids = np.full((len(task.inputs), prompt_len + gen_len),
+            self.config.pad_token_id, dtype=np.int32)
+        self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
         assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
@@ -1013,7 +1028,7 @@ class OptLM:
                 self.sync()
             timers("generate").stop()
 
-            if self.output_ids[0, self.task.prompt_len + i] == self.task.stop:
+            if self.task.stop and np.all(self.stopped):
                 break
 
     def generation_loop_overlap_multi_batch(self):
@@ -1130,6 +1145,9 @@ class OptLM:
             else:
                 timers("generate").costs.append(self.num_layers * batch_cost)
 
+    def __del__(self):
+        self.delete_all_weights()
+
 
 def get_filename(args):
     model_size = args.model.split('-')[-1]
@@ -1159,7 +1177,11 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
 
 
 def run_flexgen(args):
-    tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
+    print(f"<run_flexgen>: args.model: {args.model}")
+    if args.model == "facebook/galactica-30b":
+        tokenizer = AutoTokenizer.from_pretrained("facebook/galactica-30b", padding_side="left")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-30b", padding_side="left")
     num_prompts = args.num_gpu_batches * args.gpu_batch_size
     prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
 
@@ -1170,7 +1192,7 @@ def run_flexgen(args):
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
     disk = TorchDisk(args.offload_dir)
-    env = Env(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
+    env = ExecutionEnv(gpu=gpu, cpu=cpu, disk=disk, mixed=TorchMixedDevice([gpu, cpu, disk]))
 
     policy = Policy(args.gpu_batch_size, args.num_gpu_batches,
                     args.percent[0], args.percent[1],
@@ -1187,31 +1209,28 @@ def run_flexgen(args):
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
-    model = OptLM(opt_config, env, args.path, policy)
     cache_size = opt_config.cache_bytes(num_prompts, prompt_len + gen_len)
     hidden_size = opt_config.hidden_bytes(num_prompts, prompt_len + gen_len)
     print(f"model size: {opt_config.model_bytes()/GB:.3f} GB, "
           f"cache size: {cache_size/GB:.3f} GB, "
           f"hidden size (prefill): {hidden_size/GB:.3f} GB")
 
+    print("init weight...")
+    model = OptLM(opt_config, env, args.path, policy)
+
     try:
-        print("warmup - init weights")
-        model.init_all_weights()
         print("warmup - generate")
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose)
 
-        # Benchmark
         print("benchmark - generate")
         timers("generate").reset()
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
             debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
         costs = timers("generate").costs
-        print("benchmark - delete weights")
-        model.delete_all_weights()
     finally:
-        disk.close_copy_threads()
+        env.close_copy_threads()
 
     # Log output
     prefill_latency = costs[0]
@@ -1227,13 +1246,14 @@ def run_flexgen(args):
     _, gpu_peak_mem = gpu.mem_stats()
     _, cpu_peak_mem = cpu.mem_stats()
 
-    outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-    show_str = "Outputs:\n" + 70 * '-' + "\n"
-    for i in [0, len(outputs)-1]:
-        show_str += f"{i}: {outputs[i]}\n"
-        show_str += "-" * 70 + "\n"
-    if args.verbose >= 2:
-        print(show_str)
+    if DUMMY_WEIGHT not in args.path:
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        show_str = "Outputs:\n" + 70 * '-' + "\n"
+        for i in [0, len(outputs)-1]:
+            show_str += f"{i}: {outputs[i]}\n"
+            show_str += "-" * 70 + "\n"
+        if args.verbose >= 2:
+            print(show_str)
 
     gpu.print_stats()
     cpu.print_stats()
@@ -1264,10 +1284,10 @@ def add_parser_arguments(parser):
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument("--cut-gen-len", type=int,
         help="Cut generation length for fast debugging.")
-    parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown"])
     parser.add_argument("--gpu-batch-size", type=int, default=4)
+    parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
         default=[100, 0, 100, 0, 100, 0],
         help="Six numbers. They are "

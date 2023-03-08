@@ -1,6 +1,6 @@
 ```
 sudo apt update
-sudo apt install build-essential openmpi-bin
+sudo apt install build-essential openmpi-bin wget build-essential git
 
 wget https://developer.download.nvidia.com/compute/cuda/11.6.0/local_installers/cuda_11.6.0_510.39.01_linux.run
 sudo sh cuda_11.6.0_510.39.01_linux.run
@@ -17,14 +17,15 @@ conda activate flexgen
 
 pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
 
-git clone git@github.com:Ying1123/FlexGen.git
+git clone git@github.com:FMInference/FlexGen.git
 cd FlexGen
 pip3 install -e .
 
-cd FlexGen/third_party/DeepSpeed
+cd FlexGen/benchmark/third_party/DeepSpeed
+sudo apt install libaio-dev
 pip3 install -e .
 
-cd FlexGen/third_party/transformers
+cd FlexGen/benchmark/third_party/transformers
 pip3 install -e .
 pip3 install accelerate==0.15.0
 ```
